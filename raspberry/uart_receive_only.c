@@ -16,6 +16,8 @@ int main(){
 
     if (uart_fd == -1){
 	perror("Failed to open UART device");
-	
+	return -1;
+     }
 
+    
 }
