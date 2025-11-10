@@ -4,11 +4,9 @@ void setup(){
 }
 
 void loop(){
-    if( Serial.available() ){
-        String input = Serial.readStringUntil('\n');
-	Serial.print("Sending: ");
-	Serial.println(input);
-	delay(1000);
-    }
-
+	if(Serial.available() > 0){
+		String c = Serial.readString();
+		Serial.print("Echo : ");
+		Serial.println(c);
+	}
 }
