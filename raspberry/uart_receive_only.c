@@ -55,6 +55,7 @@ int main(){
     printf("Logging to file : %s\n", CSV_PATH);
 
     while(1){
+        write(uart_fd, "HELLO1234\n", 10);
         memset(buffer, 0, sizeof(buffer));
 
         int bytes = read(uart_fd, buffer, sizeof(buffer)-1);
