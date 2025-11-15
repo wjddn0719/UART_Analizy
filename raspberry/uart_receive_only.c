@@ -9,12 +9,18 @@
 #define BAUDRATE B9600
 #define CSV_PATH "uart_dataset.csv"
 
-int main(){
+int main(int argc, char *argv[]){
     int uart_fd;
     struct termios options;
     char buffer[256];
     char expected[] = "HELLO1234";
  
+    double cable_length = 0.0;
+    if (argc > 1) {
+        cable_length = atof(argv[1]);
+    }
+    printf("Cable Length(m): %.2f\n", cable_length);
+    
     uart_fd = open(UART_PATH, O_RDWR | O_NOCTTY | O_NDELAY);
     if (uart_fd == -1){
 	    perror("Failed to open UART device");
@@ -69,9 +75,9 @@ int main(){
             struct tm *t = localtime(&now);
             char timestamp[64];
             strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", t);
-            fprintf(fp, "%s,%s,%s\n", timestamp, buffer, result);
+            fprintf(fp, "%s,%s,%s,%.2f\n",
+                timestamp, buffer, result, cable_length);
             fflush(fp);
-
             printf("[%s] Received: %s -> %s\n", timestamp, buffer, result);
         }
         usleep(100000);
