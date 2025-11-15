@@ -45,7 +45,39 @@ int main(){
     tcsetattr(uart_fd, TCSANOW, &options);
     printf("UART configured (9600 8N1)\n");
 
-    
+    FILE *fp = fopen(CSV_PATH, "a");
+
+    if(!fp){
+        perror("Failed to open CSV file");
+        close(uart_fd);
+        return -1;
+    }
+    printf("Logging to file : %s\n", CSV_PATH);
+
+    while(1){
+        memset(buffer, 0, sizeof(buffer));
+
+        int bytes = read(uart_fd, buffer, sizeof(buffer)-1);
+
+        if(bytes > 0){
+            buffer[bytes] = '\0';
+
+            char *result = strstr(buffer, expected) ? "OK" : "ERR";
+
+            time_t now = time(NULL);
+            struct tm *t = localtime(&now);
+            char timestamp[64];
+            strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", t);
+            fprintf(fp, "%s,%s,%s\n", timestamp, buffer, result);
+            fflush(fp);
+
+            printf("[%s] Received: %s -> %s\n", timestamp, buffer, result);
+        }
+        usleep(100000);
+    }
+
+    fclose(fp);
+    close(uart_fd);
     close(uart_fd);
 
     return 0;
