@@ -4,32 +4,48 @@
 #include <unistd.h>
 #include <string.h>
 #include <time.h>
+#include <stdlib.h>
 
 #define UART_PATH "/dev/serial0"
 #define BAUDRATE B9600
 #define CSV_PATH "uart_dataset.csv"
 
+void generate_random_packet(char *buf, int len) {
+    static const char charset[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789";
+
+    for (int i = 0; i < len; i++) {
+        buf[i] = charset[rand() % (sizeof(charset) - 1)];
+    }
+    buf[len] = '\0';
+}
+
 int main(int argc, char *argv[]){
     int uart_fd;
     struct termios options;
     char buffer[256];
-    char expected[] = "HELLO1234";
- 
+    char send_packet[64];
+
+    int packet_len = 10; 
     double cable_length = 0.0;
-    if (argc > 1) {
-        cable_length = atof(argv[1]);
-    }
-    printf("Cable Length(m): %.2f\n", cable_length);
-    
+
+    srand(time(NULL));  
+
+    if (argc > 1) cable_length = atof(argv[1]);
+
+    printf("Cable Length: %.2fm\n", cable_length);
+
     uart_fd = open(UART_PATH, O_RDWR | O_NOCTTY | O_NDELAY);
     if (uart_fd == -1){
-	    perror("Failed to open UART device");
-	    return -1;
+        perror("Failed to open UART device");
+        return -1;
     }
-    printf("UART port opened: %s\n", UART_PATH);
+    printf("UART opened: %s\n", UART_PATH);
 
     if(tcgetattr(uart_fd, &options) < 0){
-        perror("Faliled to get UART attributes");
+        perror("Failed to get UART attributes");
         close(uart_fd);
         return -1;
     }
@@ -42,26 +58,28 @@ int main(int argc, char *argv[]){
     options.c_cflag &= ~CSIZE;
     options.c_cflag |= CS8;
     options.c_cflag |= (CLOCAL | CREAD);
-    
+
     options.c_iflag = IGNPAR;
     options.c_oflag = 0;
     options.c_lflag = 0;
 
     tcflush(uart_fd, TCIFLUSH);
     tcsetattr(uart_fd, TCSANOW, &options);
-    printf("UART configured (9600 8N1)\n");
 
     FILE *fp = fopen(CSV_PATH, "a");
-
     if(!fp){
         perror("Failed to open CSV file");
         close(uart_fd);
         return -1;
     }
-    printf("Logging to file : %s\n", CSV_PATH);
+    printf("Logging to CSV: %s\n", CSV_PATH);
 
     while(1){
-        write(uart_fd, "HELLO1234\n", 10);
+        generate_random_packet(send_packet, packet_len);
+
+        write(uart_fd, send_packet, strlen(send_packet));
+        write(uart_fd, "\n", 1);
+
         memset(buffer, 0, sizeof(buffer));
 
         int bytes = read(uart_fd, buffer, sizeof(buffer)-1);
@@ -69,24 +87,25 @@ int main(int argc, char *argv[]){
         if(bytes > 0){
             buffer[bytes] = '\0';
 
-            char *result = strstr(buffer, expected) ? "OK" : "ERR";
+            char *result = strstr(buffer, send_packet) ? "OK" : "ERR";
 
             time_t now = time(NULL);
             struct tm *t = localtime(&now);
             char timestamp[64];
             strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", t);
+
             fprintf(fp, "%s,%s,%s,%.2f\n",
-                timestamp, buffer, result, cable_length);
+                timestamp, result, send_packet, cable_length);
             fflush(fp);
-            printf("[%s] Received: %s -> %s\n", timestamp, buffer, result);
+
+            printf("[%s] SENT=%s | RECV=%s | %s\n",
+                   timestamp, send_packet, buffer, result);
         }
+
         usleep(100000);
     }
 
     fclose(fp);
     close(uart_fd);
-    close(uart_fd);
-
     return 0;
-    
 }
