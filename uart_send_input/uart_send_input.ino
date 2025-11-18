@@ -1,22 +1,24 @@
 void setup() {
     Serial.begin(9600);
-    Serial.println("Arduino UART Ready");
+    while (!Serial) {
+        ; // 시리얼 포트 준비 대기
+    }
+    Serial.setTimeout(100);
+    delay(1000);
 }
 
 void loop() {
-    static String sentence = "";
-
-    while (Serial.available() > 0) {
-        char c = Serial.read();
-
-        if (c == '\n') {
-            if (sentence.length() > 0) {
-                Serial.println(sentence);  // 순수 패킷만 반환
-                Serial.flush();             // 출력 즉시 완료
-                sentence = "";
-            }
-        } else {
-            sentence += c;
+    if (Serial.available() > 0) {
+        String received = Serial.readStringUntil('\n');
+        
+        // 공백 및 제어문자 제거
+        received.trim();
+        
+        if (received.length() > 0) {
+            // 순수 패킷만 반환 (println 대신 print + \n)
+            Serial.print(received);
+            Serial.print('\n');
+            Serial.flush();
         }
     }
 }
