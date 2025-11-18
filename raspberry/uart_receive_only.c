@@ -10,15 +10,25 @@
 #define BAUDRATE B9600
 #define CSV_PATH "uart_dataset.csv"
 
-// 한 줄 단위로 읽기
+// 한 줄 단위로 읽기 (개선)
 int read_line(int fd, char *buf, int max_len) {
     int idx = 0;
     char c;
+    int timeout = 0;
 
-    while (idx < max_len - 1) {
-        if (read(fd, &c, 1) > 0) {
-            if (c == '\n') break;
+    while (idx < max_len - 1 && timeout < 100) {
+        ssize_t n = read(fd, &c, 1);
+        if (n > 0) {
+            // \r과 \n 모두 처리
+            if (c == '\n' || c == '\r') {
+                if (idx > 0) break;  // 데이터가 있을 때만 종료
+                continue;  // 빈 줄 무시
+            }
             buf[idx++] = c;
+            timeout = 0;  // 데이터 수신 시 타임아웃 리셋
+        } else {
+            usleep(1000);  // 1ms 대기
+            timeout++;
         }
     }
     buf[idx] = '\0';
@@ -53,7 +63,7 @@ int main(int argc, char *argv[]) {
         cable_length = atof(argv[1]);
     }
 
-    uart_fd = open(UART_PATH, O_RDWR | O_NOCTTY | O_NDELAY);
+    uart_fd = open(UART_PATH, O_RDWR | O_NOCTTY);
     if (uart_fd < 0) {
         perror("UART open error");
         return -1;
@@ -65,18 +75,19 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    // UART 설정
     cfsetispeed(&options, BAUDRATE);
     cfsetospeed(&options, BAUDRATE);
-    options.c_cflag |= (CLOCAL | CREAD);
-    options.c_cflag &= ~PARENB;
-    options.c_cflag &= ~CSTOPB;
-    options.c_cflag &= ~CSIZE;
-    options.c_cflag |= CS8;
+    options.c_cflag = BAUDRATE | CS8 | CLOCAL | CREAD;
     options.c_iflag = IGNPAR;
     options.c_oflag = 0;
     options.c_lflag = 0;
+    
+    // Read 설정: 최소 1바이트, 타임아웃 1초
+    options.c_cc[VMIN] = 0;
+    options.c_cc[VTIME] = 10;
 
-    tcflush(uart_fd, TCIFLUSH);
+    tcflush(uart_fd, TCIOFLUSH);  // 송수신 버퍼 모두 flush
     tcsetattr(uart_fd, TCSANOW, &options);
 
     FILE *fp = fopen(CSV_PATH, "a");
@@ -86,21 +97,41 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    printf("UART Communication Started...\n");
+    sleep(2);  // 아두이노 초기화 대기
+
+    // 초기 버퍼 클리어
+    tcflush(uart_fd, TCIOFLUSH);
+
     while (1) {
         generate_random_packet(send_packet, packet_len);
 
+        // 송신 버퍼 클리어
+        tcflush(uart_fd, TCOFLUSH);
+        
         // 패킷 전송
         write(uart_fd, send_packet, strlen(send_packet));
         write(uart_fd, "\n", 1);
+        tcdrain(uart_fd);  // 전송 완료 대기
 
-        // 응답 대기
-        usleep(100000);
+        // 응답 대기 (충분한 시간 확보)
+        usleep(200000);  // 200ms
 
         // 한 줄 읽기
-        if (read_line(uart_fd, buffer, sizeof(buffer)) > 0) {
+        int len = read_line(uart_fd, buffer, sizeof(buffer));
+        
+        if (len > 0) {
+            // 공백 제거
+            char *trimmed = buffer;
+            while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+            
+            char *end = trimmed + strlen(trimmed) - 1;
+            while (end > trimmed && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
+                *end = '\0';
+                end--;
+            }
 
-            buffer[strcspn(buffer, "\r")] = '\0';
-            char *result = strcmp(buffer, send_packet) == 0 ? "OK" : "ERR";
+            char *result = strcmp(trimmed, send_packet) == 0 ? "OK" : "ERR";
 
             time_t now = time(NULL);
             struct tm *t = localtime(&now);
@@ -112,8 +143,14 @@ int main(int argc, char *argv[]) {
             fflush(fp);
 
             printf("[%s] SENT=%s | RECV=%s | %s\n",
-                   timestamp, send_packet, buffer, result);
+                   timestamp, send_packet, trimmed, result);
+        } else {
+            printf("No response received\n");
         }
+
+        // 다음 전송 전 버퍼 클리어
+        tcflush(uart_fd, TCIFLUSH);
+        usleep(100000);  // 100ms 간격
     }
 
     fclose(fp);
