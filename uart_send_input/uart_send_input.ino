@@ -1,5 +1,5 @@
 void setup() {
-    Serial.begin(38400);
+    Serial.begin(57600);
     while (!Serial) {
         ; // 시리얼 포트 준비 대기
     }
