@@ -80,6 +80,9 @@ int main(int argc, char *argv[]){
         write(uart_fd, send_packet, strlen(send_packet));
         write(uart_fd, "\n", 1);
 
+        // ★ 추가: 아두이노 응답 기다리기 (20ms)
+        usleep(20000);
+
         memset(buffer, 0, sizeof(buffer));
 
         int bytes = read(uart_fd, buffer, sizeof(buffer)-1);
@@ -102,7 +105,7 @@ int main(int argc, char *argv[]){
                    timestamp, send_packet, buffer, result);
         }
 
-        usleep(100000);
+        // tcdrain 제거됨
     }
 
     fclose(fp);
