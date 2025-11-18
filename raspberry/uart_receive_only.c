@@ -98,6 +98,8 @@ int main(int argc, char *argv[]) {
 
         // 한 줄 읽기
         if (read_line(uart_fd, buffer, sizeof(buffer)) > 0) {
+
+            buffer[strcspn(buffer, "\r")] = '\0';
             char *result = strcmp(buffer, send_packet) == 0 ? "OK" : "ERR";
 
             time_t now = time(NULL);
