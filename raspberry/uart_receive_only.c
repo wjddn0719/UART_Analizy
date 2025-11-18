@@ -94,7 +94,7 @@ int main(int argc, char *argv[]) {
         write(uart_fd, "\n", 1);
 
         // 응답 대기
-        usleep(20000);
+        usleep(100000);
 
         // 한 줄 읽기
         if (read_line(uart_fd, buffer, sizeof(buffer)) > 0) {
