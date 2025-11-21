@@ -21,6 +21,13 @@
  #include <time.h>       // 타임스탬프용
  #include <stdlib.h>     // rand, atof 등
  
+ #ifndef B460800
+ #define B460800 460800
+ #endif
+ 
+ #ifndef B921600
+ #define B921600 921600
+ #endif
  // 라즈베리파이의 UART 디바이스 경로
  #define UART_PATH "/dev/serial0"
  
@@ -41,6 +48,8 @@
          case 57600:   return B57600;
          case 115200:  return B115200;
          case 230400:  return B230400;
+         case 460800:  return B460800;
+         case 921600:  return B921600;
          default:      return -1;  // 지원하지 않는 baudrate
      }
  }
