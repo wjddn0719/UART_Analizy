@@ -111,4 +111,4 @@ def recommend(length=None, baudrate=None):
 
     return "length 또는 baudrate 중 하나를 넣어야 합니다."
 
-print(recommend(length = 0.2))
+print(recommend(baudrate = 230400))
