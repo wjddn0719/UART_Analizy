@@ -1,281 +1,1208 @@
 /*
- * UART 통신 프로그램 (라즈베리파이 - 아두이노)
+ * ============================================================================
+ * UART 통신 품질 측정 프로그램 (라즈베리파이 - 아두이노)
+ * ============================================================================
+ * 
+ * 목적:
+ *   케이블 길이와 Baudrate에 따른 UART 통신 에러율을 측정하여
+ *   머신러닝 데이터셋(CSV)을 생성
  * 
  * 동작 원리:
- * 1. 랜덤 문자열 생성
- * 2. UART로 아두이노에 전송
- * 3. 아두이노가 에코백(echo back)한 데이터 수신
- * 4. 송신/수신 데이터 비교하여 통신 품질 측정
- * 5. 결과를 CSV 파일에 저장
+ *   1. 랜덤 문자열 생성 (예: "AbC123xYz")
+ *   2. UART로 아두이노에 전송
+ *   3. 아두이노가 받은 데이터를 그대로 에코백(echo back)
+ *   4. 송신/수신 데이터를 strcmp()로 비교
+ *   5. 일치하면 OK, 불일치하면 ERR로 CSV에 기록
  * 
- * 사용법: ./program <케이블길이> <baudrate>
- * 예시: ./program 1.5 9600
- *       ./program 2.0 115200
+ * 사용법: 
+ *   ./program <케이블길이(m)> [baudrate]
+ * 
+ * 예시: 
+ *   ./program 1.5 9600      → 1.5m 케이블, 9600 bps
+ *   ./program 2.0 115200    → 2.0m 케이블, 115200 bps
+ * 
+ * 아두이노 코드 (에코백):
+ *   void setup() { Serial.begin(9600); }
+ *   void loop() {
+ *     if (Serial.available()) {
+ *       String s = Serial.readStringUntil('\n');
+ *       Serial.println(s);
+ *     }
+ *   }
+ * ============================================================================
  */
 
- #include <stdio.h>      // printf, fopen 등 표준 입출력
- #include <fcntl.h>      // open() - 파일/디바이스 열기
- #include <termios.h>    // UART 설정 구조체 및 함수
- #include <unistd.h>     // read, write, usleep 등 POSIX 함수
- #include <string.h>     // strcmp, strlen 등 문자열 함수
- #include <time.h>       // 타임스탬프용
- #include <stdlib.h>     // rand, atof 등
- 
- #ifndef B460800
- #define B460800 460800
- #endif
- 
- #ifndef B921600
- #define B921600 921600
- #endif
- // 라즈베리파이의 UART 디바이스 경로
- #define UART_PATH "/dev/serial0"
- 
- // 데이터 저장할 CSV 파일 경로
- #define CSV_PATH "uart_dataset.csv"
- 
- /*
-  * Baudrate 값을 termios 상수로 변환
-  * 
-  * 파라미터: baudrate (숫자, 예: 9600)
-  * 반환값: termios 상수 (예: B9600), 지원 안 하면 -1
-  */
- speed_t get_baudrate_constant(int baudrate) {
-     switch (baudrate) {
-         case 9600:    return B9600;
-         case 19200:   return B19200;
-         case 38400:   return B38400;
-         case 57600:   return B57600;
-         case 115200:  return B115200;
-         case 230400:  return B230400;
-         case 460800:  return B460800;
-         case 921600:  return B921600;
-         default:      return -1;  // 지원하지 않는 baudrate
-     }
- }
- 
- /*
-  * 헥스 덤프 함수 (디버깅용)
-  */
- void print_hex(const char *label, const char *str) {
-     printf("%s [len=%zu]: ", label, strlen(str));
-     for (int i = 0; str[i] != '\0'; i++) {
-         printf("%02X ", (unsigned char)str[i]);
-     }
-     printf("| \"");
-     for (int i = 0; str[i] != '\0'; i++) {
-         if (str[i] >= 32 && str[i] <= 126)
-             printf("%c", str[i]);
-         else
-             printf("<%02X>", (unsigned char)str[i]);
-     }
-     printf("\"\n");
- }
- 
- /*
-  * UART에서 한 줄 읽기 함수
-  */
- int read_line(int fd, char *buf, int max_len) {
-     int idx = 0;
-     char c;
-     int timeout = 0;
- 
-     printf("[DEBUG] Starting read_line...\n");
- 
-     while (idx < max_len - 1 && timeout < 200) {
-         ssize_t n = read(fd, &c, 1);
-         if (n > 0) {
-             printf("[DEBUG] Read byte: 0x%02X ('%c')\n", (unsigned char)c, 
-                    (c >= 32 && c <= 126) ? c : '?');
-             
-             if (c == '\n' || c == '\r') {
-                 if (idx > 0) {
-                     printf("[DEBUG] Line end detected, idx=%d\n", idx);
-                     break;
-                 }
-                 continue;
-             }
-             buf[idx++] = c;
-             timeout = 0;
-         } else {
-             usleep(1000);
-             timeout++;
-         }
-     }
-     buf[idx] = '\0';
-     printf("[DEBUG] read_line complete: idx=%d, timeout=%d\n", idx, timeout);
-     return idx;
- }
- 
- /*
-  * 랜덤 패킷 생성 함수
-  */
- void generate_random_packet(char *buf, int len) {
-     static const char charset[] =
-         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-         "abcdefghijklmnopqrstuvwxyz"
-         "0123456789";
- 
-     for (int i = 0; i < len; i++) {
-         buf[i] = charset[rand() % (sizeof(charset) - 1)];
-     }
-     buf[len] = '\0';
- }
- 
- int main(int argc, char *argv[]) {
-     // ========== 변수 선언 ==========
-     int uart_fd;
-     struct termios options;
-     char buffer[256];
-     char send_packet[64];
- 
-     int packet_len = 10;
-     double cable_length = 0.0;
-     int baudrate = 9600;  // 기본값
- 
-     srand(time(NULL));
- 
-     // ========== 명령줄 인자 처리 ==========
-     /*
-      * 사용법: ./program <케이블길이> [baudrate]
-      * 
-      * 예시:
-      *   ./program 1.5          → 1.5m, 9600 bps
-      *   ./program 1.5 115200   → 1.5m, 115200 bps
-      */
-     if (argc < 2) {
-         printf("Usage: %s <cable_length> [baudrate]\n", argv[0]);
-         printf("Example: %s 1.5 115200\n", argv[0]);
-         printf("\nSupported baudrates: 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600\n");
-         return -1;
-     }
- 
-     cable_length = atof(argv[1]);  // 첫 번째 인자: 케이블 길이
-     
-     if (argc > 2) {
-         baudrate = atoi(argv[2]);  // 두 번째 인자: baudrate
-     }
- 
-     // Baudrate 유효성 검사
-     speed_t baud_const = get_baudrate_constant(baudrate);
-     if (baud_const == (speed_t)-1) {
-         printf("Error: Unsupported baudrate %d\n", baudrate);
-         printf("Supported: 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600\n");
-         return -1;
-     }
- 
-     printf("===========================================\n");
-     printf("Cable Length: %.2f m\n", cable_length);
-     printf("Baudrate: %d bps\n", baudrate);
-     printf("===========================================\n\n");
- 
-     // ========== UART 디바이스 열기 ==========
-     printf("Opening UART: %s\n", UART_PATH);
-     uart_fd = open(UART_PATH, O_RDWR | O_NOCTTY);
-     if (uart_fd < 0) {
-         perror("UART open error");
-         return -1;
-     }
-     printf("UART opened successfully: fd=%d\n", uart_fd);
- 
-     // ========== UART 설정 ==========
-     if (tcgetattr(uart_fd, &options) < 0) {
-         perror("UART attr error");
-         close(uart_fd);
-         return -1;
-     }
- 
-     // Baudrate 설정 (매개변수로 받은 값 사용)
-     cfsetispeed(&options, baud_const);
-     cfsetospeed(&options, baud_const);
-     
-     options.c_cflag = baud_const | CS8 | CLOCAL | CREAD;
-     options.c_iflag = IGNPAR;
-     options.c_oflag = 0;
-     options.c_lflag = 0;
-     options.c_cc[VMIN] = 0;
-     options.c_cc[VTIME] = 10;
- 
-     tcflush(uart_fd, TCIOFLUSH);
-     tcsetattr(uart_fd, TCSANOW, &options);
-     printf("UART configured: %d 8N1\n", baudrate);
- 
-     // ========== CSV 파일 열기 ==========
-     FILE *fp = fopen(CSV_PATH, "a");
-     if (!fp) {
-         perror("CSV open error");
-         close(uart_fd);
-         return -1;
-     }
- 
-     // ========== 아두이노 초기화 대기 ==========
-     printf("Waiting for Arduino initialization...\n");
-     sleep(2);
-     tcflush(uart_fd, TCIOFLUSH);
-     printf("Starting communication loop...\n\n");
- 
-     // ========== 메인 통신 루프 ==========
-     int loop_count = 0;
-     while (1) {
-         printf("\n========== Loop %d ==========\n", ++loop_count);
-         
-         generate_random_packet(send_packet, packet_len);
-         tcflush(uart_fd, TCOFLUSH);
-         
-         printf("[SEND] Writing packet...\n");
-         ssize_t written = write(uart_fd, send_packet, strlen(send_packet));
-         write(uart_fd, "\n", 1);
-         tcdrain(uart_fd);
-         printf("[SEND] Written %zd bytes\n", written);
-         print_hex("SENT", send_packet);
- 
-         printf("[RECV] Waiting for response (100ms)...\n");
-         usleep(100000);
- 
-         int len = read_line(uart_fd, buffer, sizeof(buffer));
-         
-         if (len > 0) {
-             print_hex("RECV_RAW", buffer);
-             
-             // Trim
-             char *trimmed = buffer;
-             while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
-             char *end = trimmed + strlen(trimmed) - 1;
-             while (end > trimmed && 
-                    (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
-                 *end = '\0';
-                 end--;
-             }
-             
-             print_hex("RECV_TRIMMED", trimmed);
- 
-             int cmp_result = strcmp(trimmed, send_packet);
-             printf("strcmp(RECV, SENT) = %d\n", cmp_result);
-             char *result = (cmp_result == 0) ? "OK" : "ERR";
- 
-             time_t now = time(NULL);
-             struct tm *t = localtime(&now);
-             char timestamp[64];
-             strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", t);
- 
-             // CSV에 저장: 타임스탬프,결과,패킷,케이블길이,Baudrate
-             fprintf(fp, "%s,%s,%s,%.2f,%d\n",
-                     timestamp, result, send_packet, cable_length, baudrate);
-             fflush(fp);
- 
-             printf("\n[RESULT] %s\n", result);
-             printf("[LOG] %s,%s,%s,%.2f,%d\n",
-                    timestamp, result, send_packet, cable_length, baudrate);
-         } else {
-             printf("[ERROR] No response received (len=%d)\n", len);
-         }
- 
-         tcflush(uart_fd, TCIFLUSH);
-         printf("\n[WAIT] 100ms before next loop...\n");
-         usleep(100000);
-     }
- 
-     fclose(fp);
-     close(uart_fd);
-     return 0;
- }
+ #include <stdio.h>      // printf, fopen, fprintf, fflush, perror
+ // 표준 입출력 함수들
+
+#include <fcntl.h>      // open() 함수와 플래그 정의
+ // O_RDWR, O_NOCTTY 등
+
+#include <termios.h>    // UART(시리얼) 통신 설정을 위한 구조체와 함수
+ // struct termios, tcgetattr, tcsetattr, cfsetispeed 등
+ // B9600, B115200 등 Baudrate 상수
+
+#include <unistd.h>     // POSIX 시스템 콜
+ // read, write, close, usleep, sleep
+
+#include <string.h>     // 문자열 처리 함수
+ // strcmp, strlen
+
+#include <time.h>       // 시간 관련 함수
+ // time, localtime, strftime
+
+#include <stdlib.h>     // 유틸리티 함수
+ // rand, srand, atof, atoi
+
+/*
+* ----------------------------------------------------------------------------
+* 고속 Baudrate 상수 정의
+* ----------------------------------------------------------------------------
+* 일부 구형 시스템이나 특정 리눅스 배포판에서는
+* B460800, B921600 상수가 termios.h에 정의되어 있지 않을 수 있음
+* 
+* #ifndef ~ #endif: 조건부 컴파일
+*   이미 정의되어 있으면 건너뛰고, 없으면 정의
+*   중복 정의 에러 방지
+*/
+#ifndef B460800
+#define B460800 460800
+#endif
+
+#ifndef B921600
+#define B921600 921600
+#endif
+
+/*
+* ----------------------------------------------------------------------------
+* 상수 정의
+* ----------------------------------------------------------------------------
+*/
+
+/*
+* UART 디바이스 경로
+* 
+* 리눅스에서는 "모든 것이 파일"이라는 철학에 따라
+* UART 같은 하드웨어 장치도 /dev/ 디렉토리 아래 파일로 접근
+* 
+* /dev/serial0:
+*   라즈베리파이에서 GPIO 14(TXD), GPIO 15(RXD)에 연결된 UART
+*   이것은 심볼릭 링크로, 실제로는 아래 중 하나를 가리킴:
+*     - /dev/ttyAMA0: PL011 UART (하드웨어 UART, 더 안정적)
+*     - /dev/ttyS0: Mini UART (소프트웨어 UART)
+*   
+*   라즈베리파이 모델과 설정에 따라 다름
+*   raspi-config에서 Serial Port 설정 필요
+*/
+#define UART_PATH "/dev/serial0"
+
+/*
+* CSV 파일 경로
+* 측정 결과가 이 파일에 계속 추가됨
+*/
+#define CSV_PATH "uart_dataset.csv"
+
+
+/*
+* ============================================================================
+* Baudrate 변환 함수
+* ============================================================================
+* 
+* termios 라이브러리는 Baudrate를 직접 숫자(115200)로 받지 않고,
+* 미리 정의된 상수(B115200)를 사용함
+* 
+* 이유:
+*   1. 역사적으로 하드웨어마다 지원하는 속도가 달랐음
+*   2. 상수를 통해 컴파일 타임에 유효성 검사 가능
+*   3. 플랫폼 독립성 (내부 표현이 달라도 상수는 동일)
+* 
+* 파라미터:
+*   baudrate - 사용자가 입력한 숫자 (예: 9600, 115200)
+* 
+* 반환값:
+*   성공: 해당하는 termios 상수 (예: B9600, B115200)
+*   실패: -1 (지원하지 않는 Baudrate)
+* 
+* speed_t:
+*   Baudrate를 저장하는 타입 (보통 unsigned int)
+*   termios.h에 정의됨
+*/
+speed_t get_baudrate_constant(int baudrate) {
+switch (baudrate) {
+case 9600:    return B9600;     // 저속, 가장 안정적, 긴 케이블 가능
+case 19200:   return B19200;    
+case 38400:   return B38400;    
+case 57600:   return B57600;    
+case 115200:  return B115200;   // 아두이노 기본값으로 많이 사용
+case 230400:  return B230400;   
+case 460800:  return B460800;   // 고속
+case 921600:  return B921600;   // 최고속, 짧은 케이블에서만 안정
+default:      return -1;        // 지원하지 않는 값
+}
+}
+
+
+/*
+* ============================================================================
+* 헥스 덤프 함수 (디버깅용)
+* ============================================================================
+* 
+* UART 통신에서 문제가 생기면 눈에 보이지 않는 문자가 원인인 경우가 많음
+* 예: \r, \n, NULL, 제어 문자, 깨진 바이트 등
+* 
+* 이 함수는 문자열의 각 바이트를 두 가지 형태로 출력:
+*   1. 16진수 값 (41 42 43)
+*   2. 가독 형태 ("ABC" 또는 <0D> 같은 이스케이프)
+* 
+* 출력 예시:
+*   SENT [len=5]: 48 65 6C 6C 6F | "Hello"
+*   RECV [len=7]: 48 65 6C 6C 6F 0D 0A | "Hello<0D><0A>"
+* 
+* 파라미터:
+*   label - 출력 앞에 붙일 라벨 문자열 (예: "SENT", "RECV")
+*   str   - 출력할 문자열
+*/
+void print_hex(const char *label, const char *str) {
+// 라벨과 문자열 길이 출력
+// %zu: size_t 타입 출력 포맷 (strlen의 반환 타입)
+printf("%s [len=%zu]: ", label, strlen(str));
+
+// 각 바이트를 16진수로 출력
+// %02X: 2자리 대문자 16진수, 빈자리는 0으로 채움
+// (unsigned char): 음수로 해석되는 것 방지 (0x80 이상 값)
+for (int i = 0; str[i] != '\0'; i++) {
+printf("%02X ", (unsigned char)str[i]);
+}
+
+// 구분자와 함께 읽을 수 있는 형태로도 출력
+printf("| \"");
+for (int i = 0; str[i] != '\0'; i++) {
+// ASCII 32(공백) ~ 126(~) 범위는 출력 가능한 문자
+// 이 범위 밖은 제어 문자이거나 확장 ASCII
+if (str[i] >= 32 && str[i] <= 126) {
+printf("%c", str[i]);  // 그대로 출력
+} else {
+// 제어 문자는 <16진수> 형태로 표시
+// 예: 캐리지 리턴(13) → <0D>
+printf("<%02X>", (unsigned char)str[i]);
+}
+}
+printf("\"\n");
+}
+
+
+/*
+* ============================================================================
+* UART 한 줄 읽기 함수
+* ============================================================================
+* 
+* 아두이노는 Serial.println()으로 데이터 끝에 \r\n을 붙여서 전송
+* 이 함수는 개행 문자를 만날 때까지 바이트 단위로 읽음
+* 
+* 왜 바이트 단위로 읽나?
+*   - read(fd, buf, 256)으로 한 번에 읽으면 여러 줄이 섞일 수 있음
+*   - 개행 위치를 정확히 알 수 없음
+*   - 바이트 단위 읽기가 더 정확한 파싱 가능
+* 
+* 파라미터:
+*   fd      - UART 파일 디스크립터 (open()의 반환값)
+*   buf     - 읽은 데이터를 저장할 버퍼
+*   max_len - 버퍼의 최대 크기
+* 
+* 반환값:
+*   읽은 문자 수 (개행 문자 제외, null 포함 안 함)
+* 
+* 타임아웃:
+*   200ms 동안 데이터가 없으면 읽기 종료
+*   (1ms × 200회 = 200ms)
+*   무한 대기 방지
+*/
+int read_line(int fd, char *buf, int max_len) {
+int idx = 0;          // 현재까지 읽은 바이트 수 (버퍼 인덱스)
+char c;               // 읽은 1바이트를 저장할 변수
+int timeout = 0;      // 타임아웃 카운터
+
+printf("[DEBUG] Starting read_line...\n");
+
+// 루프 종료 조건:
+//   1. 버퍼가 꽉 참 (idx >= max_len - 1, null 자리 남김)
+//   2. 타임아웃 (200회 × 1ms = 200ms)
+//   3. 개행 문자 발견 (break)
+while (idx < max_len - 1 && timeout < 200) {
+// 1바이트 읽기 시도
+// read()는 우리 설정(VMIN=0, VTIME=10)에서:
+//   - 데이터 있으면 즉시 반환
+//   - 없으면 1초까지 대기 후 0 반환
+// 하지만 우리는 더 짧은 타임아웃을 위해 직접 폴링
+ssize_t n = read(fd, &c, 1);
+
+if (n > 0) {
+// 데이터를 성공적으로 읽음
+printf("[DEBUG] Read byte: 0x%02X ('%c')\n", 
+(unsigned char)c,
+(c >= 32 && c <= 126) ? c : '?');  // 출력 불가능하면 '?'
+
+// 개행 문자 처리 (\n = 0x0A, \r = 0x0D)
+if (c == '\n' || c == '\r') {
+if (idx > 0) {
+// 이미 데이터를 읽은 상태에서 개행 발견
+// → 한 줄 완성, 루프 종료
+printf("[DEBUG] Line end detected, idx=%d\n", idx);
+break;
+}
+// idx == 0이면 아직 실제 데이터가 없음
+// 줄 시작의 빈 개행(\r\n의 첫 번째 문자)일 수 있음
+// 무시하고 계속
+continue;
+}
+
+// 일반 문자는 버퍼에 저장
+buf[idx++] = c;
+timeout = 0;  // 데이터 받으면 타임아웃 카운터 리셋
+} else {
+// n <= 0: 읽을 데이터 없음
+// 1ms 대기 후 재시도 (busy waiting 방지)
+usleep(1000);  // 1000 마이크로초 = 1ms
+timeout++;
+}
+}
+
+// 문자열 종료 문자 추가 (C 문자열 규약)
+buf[idx] = '\0';
+
+printf("[DEBUG] read_line complete: idx=%d, timeout=%d\n", idx, timeout);
+return idx;
+}
+
+
+/*
+* ============================================================================
+* 랜덤 패킷 생성 함수
+* ============================================================================
+* 
+* UART 통신 테스트를 위해 무작위 문자열 생성
+* 
+* 왜 랜덤 패킷을 사용하나?
+*   1. 항상 같은 문자열(예: "Hello")을 보내면:
+*      - 버퍼에 이전 데이터가 남아있어도 우연히 일치할 수 있음
+*      - 실제 통신 없이도 "OK"로 판정될 수 있음
+*   
+*   2. 매번 다른 문자열을 보내면:
+*      - 송신한 것과 정확히 일치해야만 OK
+*      - 진짜 통신이 성공했는지 확실히 검증 가능
+*   
+*   3. 다양한 비트 패턴 테스트:
+*      - 특정 문자 조합에서만 에러가 발생할 수 있음
+*      - 랜덤하면 다양한 패턴을 커버
+* 
+* 파라미터:
+*   buf - 생성된 패킷을 저장할 버퍼 (len+1 이상 크기 필요)
+*   len - 생성할 패킷 길이 (null 제외)
+*/
+void generate_random_packet(char *buf, int len) {
+// 사용할 문자 집합: 영문 대문자 + 소문자 + 숫자
+// 총 62개 문자 (26 + 26 + 10)
+// 특수문자 제외 이유: 일부 특수문자는 UART에서 제어 용도로 쓰일 수 있음
+static const char charset[] =
+"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+"abcdefghijklmnopqrstuvwxyz"
+"0123456789";
+
+for (int i = 0; i < len; i++) {
+// rand(): 0 ~ RAND_MAX 사이 난수 생성
+// % (sizeof(charset) - 1): 0 ~ 61 범위로 제한
+//   sizeof(charset)는 62+1=63 (null 포함)
+//   -1 하면 62, % 62하면 0~61
+int random_index = rand() % (sizeof(charset) - 1);
+buf[i] = charset[random_index];
+}
+
+// 문자열 종료
+buf[len] = '\0';
+}
+
+
+/*
+* ============================================================================
+* 메인 함수
+* ============================================================================
+*/
+int main(int argc, char *argv[]) {
+
+// ========================================================================
+// 변수 선언
+// ========================================================================
+
+int uart_fd;              // UART 파일 디스크립터
+       // open() 성공 시 0 이상의 정수
+       // 이후 모든 read/write/ioctl에서 사용
+
+struct termios options;   // UART 설정을 담는 구조체
+       // termios.h에 정의됨
+       // c_iflag, c_oflag, c_cflag, c_lflag, c_cc[] 포함
+
+char buffer[256];         // 수신 데이터 버퍼
+char send_packet[64];     // 송신 패킷 버퍼
+
+int packet_len = 10;      // 테스트 패킷 길이 (10글자)
+       // 너무 짧으면 우연히 일치할 확률 높음
+       // 너무 길면 전송 시간 증가
+
+double cable_length = 0.0;  // 케이블 길이 (미터)
+         // 명령줄에서 입력받음
+
+int baudrate = 9600;        // 통신 속도 기본값
+         // 명령줄에서 입력받으면 덮어씀
+
+// 난수 시드 초기화
+// time(NULL): 1970.1.1부터 현재까지의 초 (매 초 다른 값)
+// srand(): 이 값으로 난수 생성기 초기화
+// 같은 시드 → 같은 난수 시퀀스 (재현성)
+// 다른 시드 → 다른 난수 시퀀스 (매 실행마다 다른 패킷)
+srand(time(NULL));
+
+
+// ========================================================================
+// 명령줄 인자 처리
+// ========================================================================
+/*
+* argc (argument count): 인자 개수 (프로그램명 포함)
+* argv (argument vector): 인자 문자열 배열
+* 
+* 예: ./program 1.5 115200
+*     argc = 3
+*     argv[0] = "./program"
+*     argv[1] = "1.5"
+*     argv[2] = "115200"
+*/
+
+if (argc < 2) {
+// 최소 인자 (케이블 길이) 누락
+printf("Usage: %s <cable_length> [baudrate]\n", argv[0]);
+printf("Example: %s 1.5 115200\n", argv[0]);
+printf("\nSupported baudrates: 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600\n");
+return -1;
+}
+
+// atof (ASCII to Float): 문자열을 double로 변환
+// "1.5" → 1.5
+// 변환 실패 시 0.0 반환 (에러 체크는 생략됨)
+cable_length = atof(argv[1]);
+
+if (argc > 2) {
+// Baudrate 인자가 있으면 사용
+// atoi (ASCII to Integer): 문자열을 int로 변환
+// "115200" → 115200
+baudrate = atoi(argv[2]);
+}
+
+// Baudrate 유효성 검사
+speed_t baud_const = get_baudrate_constant(baudrate);
+if (baud_const == (speed_t)-1) {
+printf("Error: Unsupported baudrate %d\n", baudrate);
+printf("Supported: 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600\n");
+return -1;
+}
+
+// 설정 정보 출력
+printf("===========================================\n");
+printf("Cable Length: %.2f m\n", cable_length);
+printf("Baudrate: %d bps\n", baudrate);
+printf("===========================================\n\n");
+
+
+// ========================================================================
+// UART 디바이스 열기
+// ========================================================================
+/*
+* open(경로, 플래그): 파일/디바이스 열기
+* 
+* O_RDWR (Read/Write):
+*   읽기와 쓰기 모두 가능하도록 열기
+*   UART는 양방향(TX/RX) 통신이므로 필수
+*   
+*   다른 옵션들:
+*     O_RDONLY - 읽기 전용 (수신만)
+*     O_WRONLY - 쓰기 전용 (송신만)
+* 
+* O_NOCTTY (No Controlling TTY):
+*   이 디바이스를 프로세스의 "제어 터미널"로 설정하지 않음
+*   
+*   제어 터미널이란?
+*     - 프로세스와 연결된 터미널
+*     - Ctrl+C, Ctrl+Z 같은 신호를 받는 터미널
+*   
+*   이 플래그가 없으면?
+*     - UART가 제어 터미널이 될 수 있음
+*     - UART로 0x03(Ctrl+C와 같은 바이트)이 들어오면
+*       프로그램에 SIGINT가 전달되어 종료될 수 있음!
+*   
+*   이 플래그를 설정하면?
+*     - UART는 순수 데이터 통신용으로만 사용
+*     - 어떤 바이트가 와도 신호로 해석하지 않음
+* 
+* 반환값:
+*   성공: 파일 디스크립터 (0 이상의 정수)
+*         작은 정수부터 순차적으로 할당됨
+*         (0=stdin, 1=stdout, 2=stderr는 이미 사용 중)
+*   실패: -1 (errno에 에러 코드 설정)
+*/
+printf("Opening UART: %s\n", UART_PATH);
+uart_fd = open(UART_PATH, O_RDWR | O_NOCTTY);
+
+if (uart_fd < 0) {
+// perror(): errno를 읽어서 해당하는 에러 메시지 출력
+// 출력 예:
+//   "UART open error: Permission denied"  (권한 없음, sudo 필요)
+//   "UART open error: No such file or directory"  (디바이스 없음)
+//   "UART open error: Device or resource busy"  (다른 프로그램 사용 중)
+perror("UART open error");
+return -1;
+}
+printf("UART opened successfully: fd=%d\n", uart_fd);
+
+
+// ========================================================================
+// UART 설정 읽기
+// ========================================================================
+/*
+* tcgetattr(): 터미널(UART) 속성 가져오기
+* 
+* 현재 설정을 options 구조체로 복사
+* 
+* 왜 기존 설정을 먼저 읽나?
+*   1. struct termios를 0으로 초기화해도 되지만
+*   2. 시스템 기본값을 유지하는 게 안전
+*   3. 우리가 모르는 플래그가 기본값으로 적절히 설정되어 있을 수 있음
+*   4. 필요한 부분만 수정하는 방식이 관례
+*/
+if (tcgetattr(uart_fd, &options) < 0) {
+perror("UART attr error");
+close(uart_fd);  // 열었던 디바이스 닫기
+return -1;
+}
+
+
+// ========================================================================
+// Baudrate 설정
+// ========================================================================
+/*
+* Baudrate(보드레이트)란?
+*   초당 전송되는 심볼(신호 변화) 수
+*   UART에서는 1 심볼 = 1 비트이므로 bps(bits per second)와 동일
+* 
+* 예: 9600 baud
+*   - 초당 9600 비트 전송
+*   - 1비트 시간 = 1/9600 ≈ 104μs
+*   
+*   8N1 포맷에서 1문자 전송에 필요한 비트:
+*     시작 비트(1) + 데이터(8) + 정지 비트(1) = 10비트
+*   
+*   초당 전송 가능한 문자 수:
+*     9600 / 10 = 960 문자/초
+* 
+* cfsetispeed(): 입력(수신, RX) Baudrate 설정
+* cfsetospeed(): 출력(송신, TX) Baudrate 설정
+* 
+* 대부분 입출력 속도를 동일하게 설정
+* 서로 다른 속도를 사용하는 경우는 드묾
+*/
+cfsetispeed(&options, baud_const);
+cfsetospeed(&options, baud_const);
+
+
+// ========================================================================
+// 제어 플래그 (c_cflag) 설정
+// ========================================================================
+/*
+* c_cflag: Control Flags
+* UART의 물리적 통신 특성을 결정하는 플래그 모음
+* 
+* 비트 OR 연산(|)으로 여러 플래그를 조합
+*/
+options.c_cflag = baud_const | CS8 | CLOCAL | CREAD;
+/*
+* 각 플래그 상세 설명:
+* 
+* baud_const:
+*   Baudrate 설정값 (B9600, B115200 등)
+*   c_cflag의 하위 비트들이 Baudrate를 나타냄
+* 
+* CS8 (Character Size 8):
+*   데이터 비트 수 = 8비트
+*   
+*   다른 옵션들:
+*     CS5 - 5비트 데이터 (Baudot 코드, 아주 구형)
+*     CS6 - 6비트 데이터 (드묾)
+*     CS7 - 7비트 데이터 (ASCII 전용, 패리티와 함께 사용)
+*     CS8 - 8비트 데이터 (현대 표준, 바이너리 데이터 가능)
+*   
+*   아두이노 Serial은 기본 8비트
+*   현대 대부분의 시스템이 8비트 사용
+* 
+* CLOCAL (Local connection):
+*   모뎀 제어 신호선 무시
+*   
+*   시리얼 포트의 역사:
+*     원래 RS-232는 모뎀 연결용으로 설계됨
+*     모뎀은 여러 제어 신호선을 사용:
+*       DCD (Data Carrier Detect) - 상대방 모뎀 연결됨
+*       DTR (Data Terminal Ready) - 터미널 준비됨
+*       DSR (Data Set Ready) - 모뎀 준비됨
+*       RTS/CTS - 흐름 제어
+*   
+*   우리 상황 (직접 연결):
+*     - 라즈베리파이 ↔ 아두이노 직접 연결
+*     - TX, RX, GND만 연결, 제어선 없음
+*     - CLOCAL 없으면 DCD 신호를 기다리며 블록될 수 있음
+*   
+*   CLOCAL 설정 효과:
+*     - 제어 신호선 상태와 관계없이 통신 가능
+*     - 3선 연결(TX, RX, GND)만으로 동작
+* 
+* CREAD (Enable Receiver):
+*   수신기 활성화
+*   
+*   이 플래그 없으면:
+*     - 데이터 송신은 가능
+*     - 데이터 수신 불가 (read()가 항상 0 반환)
+*   
+*   이 플래그 있으면:
+*     - 송수신 모두 가능
+*   
+*   항상 설정하는 게 일반적
+*/
+
+
+// ========================================================================
+// 입력 플래그 (c_iflag) 설정
+// ========================================================================
+/*
+* c_iflag: Input Flags
+* 수신된 데이터의 전처리 방식을 결정
+*/
+options.c_iflag = IGNPAR;
+/*
+* IGNPAR (Ignore Parity errors):
+*   패리티 에러가 있는 바이트 무시 (버림)
+*   
+*   패리티 비트란?
+*     간단한 에러 검출 방식
+*     데이터 비트들의 1의 개수를 세어서
+*       짝수 패리티: 1의 총 개수가 짝수가 되도록 패리티 비트 설정
+*       홀수 패리티: 1의 총 개수가 홀수가 되도록 패리티 비트 설정
+*   
+*   우리 설정 (8N1):
+*     N = No parity (패리티 없음)
+*     패리티 비트를 사용하지 않음
+*   
+*   그런데 왜 IGNPAR?
+*     노이즈로 인해 패리티 플래그가 잘못 설정될 수 있음
+*     어차피 패리티 안 쓰니까 에러 무시
+* 
+* 설정하지 않은 플래그들 (0으로 클리어됨):
+* 
+*   IGNBRK  - Break 조건 무시
+*             Break = 라인을 긴 시간 동안 0으로 유지
+*   
+*   BRKINT  - Break시 SIGINT 발생
+*   
+*   PARMRK  - 패리티 에러 마킹
+*             에러 있는 바이트 앞에 0xFF 0x00 삽입
+*   
+*   ISTRIP  - 8번째 비트 제거 (MSB = 0으로)
+*             7비트 ASCII 시스템용
+*             바이너리 데이터 손상 주의!
+*   
+*   INLCR   - 입력의 NL(\n)을 CR(\r)로 변환
+*   
+*   IGNCR   - 입력의 CR(\r) 무시 (버림)
+*   
+*   ICRNL   - 입력의 CR(\r)을 NL(\n)로 변환
+*             이게 켜지면 \r이 \n으로 바뀌어서 
+*             데이터가 달라질 수 있음! (위험)
+*   
+*   IXON    - XON/XOFF 출력 흐름 제어 활성화
+*             0x13(XOFF, Ctrl+S) 받으면 송신 중지
+*             0x11(XON, Ctrl+Q) 받으면 송신 재개
+*             데이터에 0x11, 0x13 있으면 문제 발생!
+*   
+*   IXOFF   - XON/XOFF 입력 흐름 제어 활성화
+*   
+*   IXANY   - 아무 문자로 송신 재개 (XON 아니어도)
+* 
+* Raw 모드를 위해 위 플래그들을 모두 0으로:
+*   - 바이너리 데이터가 변형 없이 그대로 통과
+*   - 어떤 바이트 값이 와도 특별한 의미로 해석하지 않음
+*/
+
+
+// ========================================================================
+// 출력 플래그 (c_oflag) 설정
+// ========================================================================
+/*
+* c_oflag: Output Flags
+* 송신 데이터의 후처리 방식을 결정
+*/
+options.c_oflag = 0;
+/*
+* 모든 출력 처리 비활성화 (Raw 출력)
+* 
+* 설정하지 않은 플래그들:
+* 
+*   OPOST   - 출력 후처리 활성화 (마스터 스위치)
+*             이게 0이면 다른 출력 플래그들 무시됨
+*   
+*   ONLCR   - 출력의 NL(\n)을 CR+NL(\r\n)로 변환
+*             터미널에서 줄바꿈이 예쁘게 보이도록
+*             하지만 UART 통신에서는 데이터 변형!
+*             \n 보냈는데 \r\n 나가면 비교 실패
+*   
+*   OCRNL   - 출력의 CR(\r)을 NL(\n)로 변환
+*   
+*   ONOCR   - 컬럼 0에서 CR 출력하지 않음
+*   
+*   ONLRET  - NL이 CR 역할도 수행 (커서 맨 앞으로)
+*   
+*   OFILL   - 타이밍 지연 대신 채움 문자 사용
+*   
+*   OFDEL   - 채움 문자를 DEL(0x7F)로 (기본은 NUL)
+*   
+*   NLDLYn, CRDLYn, TABDLYn, BSDLYn, VTDLYn, FFDLYn
+*             - 각종 지연 설정 (구형 터미널용)
+* 
+* 0으로 설정하면:
+*   - write()로 보낸 바이트가 그대로 나감
+*   - 어떤 변환도 없음
+*/
+
+
+// ========================================================================
+// 로컬 플래그 (c_lflag) 설정
+// ========================================================================
+/*
+* c_lflag: Local Flags
+* 터미널의 동작 모드를 결정
+* Canonical 모드 vs Non-canonical(Raw) 모드
+*/
+options.c_lflag = 0;
+/*
+* 모든 로컬 처리 비활성화 = Raw 모드
+* 
+* 가장 중요한 두 모드:
+* 
+* [Canonical 모드] (ICANON 플래그 설정 시)
+*   - 줄 단위 입력
+*   - Enter(\n)를 누를 때까지 버퍼에 저장
+*   - 백스페이스, Ctrl+U 등으로 입력 수정 가능
+*   - 터미널에서 명령어 입력할 때 이 모드
+*   - read()는 한 줄이 완성되어야 반환
+* 
+* [Non-canonical/Raw 모드] (ICANON 플래그 해제 시)
+*   - 바이트 단위 입력
+*   - 데이터가 들어오는 즉시 read() 가능
+*   - 줄 편집 기능 없음
+*   - UART 통신에 적합!
+* 
+* 주요 플래그 설명:
+* 
+*   ICANON  - Canonical 모드 활성화
+*             0으로 해서 Raw 모드
+*   
+*   ECHO    - 입력 에코
+*             터미널에서 키 누르면 화면에 보이는 것
+*             UART에서는 불필요 (아두이노가 에코해줌)
+*             0으로 비활성화
+*   
+*   ECHOE   - 백스페이스 에코 처리
+*             지운 문자를 화면에서도 제거
+*   
+*   ECHOK   - Kill 문자 후 NL 에코
+*   
+*   ECHONL  - NL 에코 (ECHO 꺼져도)
+*   
+*   ISIG    - 신호 문자 처리
+*             Ctrl+C → SIGINT
+*             Ctrl+Z → SIGTSTP
+*             Ctrl+\ → SIGQUIT
+*             
+*             0으로 비활성화해야:
+*               UART로 0x03(Ctrl+C)이 와도 프로그램 안 죽음!
+*   
+*   IEXTEN  - 확장 입력 처리
+*             Ctrl+V (다음 문자 그대로 입력)
+*             Ctrl+O (출력 플러시)
+*   
+*   TOSTOP  - 백그라운드 프로세스 출력 시 SIGTTOU 발생
+*   
+*   NOFLSH  - 신호 발생 후 버퍼 플러시 안 함
+*/
+
+
+// ========================================================================
+// 제어 문자 배열 (c_cc) 설정
+// ========================================================================
+/*
+* c_cc[]: Control Characters 배열
+* 특수 제어 문자 정의 및 타이밍 설정
+* 
+* Raw 모드에서 가장 중요한 것: VMIN과 VTIME
+* 이 두 값이 read()의 동작 방식을 결정
+*/
+options.c_cc[VMIN] = 0;
+options.c_cc[VTIME] = 10;
+/*
+* VMIN: read()가 반환하기 위한 최소 바이트 수
+* VTIME: 타임아웃 (단위: 1/10초 = 100ms)
+* 
+* ┌─────────┬─────────┬────────────────────────────────────────┐
+* │  VMIN   │  VTIME  │  read(fd, buf, n)의 동작              │
+* ├─────────┼─────────┼────────────────────────────────────────┤
+* │    0    │    0    │  완전 비블로킹 (non-blocking)          │
+* │         │         │  데이터 있으면 읽고, 없으면 즉시 0 반환│
+* │         │         │  폴링할 때 사용                        │
+* ├─────────┼─────────┼────────────────────────────────────────┤
+* │    0    │   >0    │  ★ 우리 설정 ★                       │
+* │         │         │  데이터 있으면 즉시 읽고 반환          │
+* │         │         │  없으면 VTIME(0.1초 단위)까지 대기     │
+* │         │         │  타임아웃 후 0 반환                    │
+* │         │         │  "타임아웃 있는 읽기"                  │
+* ├─────────┼─────────┼────────────────────────────────────────┤
+* │   >0    │    0    │  완전 블로킹                           │
+* │         │         │  VMIN 바이트 받을 때까지 무한 대기     │
+* │         │         │  데이터 확실히 올 때 사용              │
+* ├─────────┼─────────┼────────────────────────────────────────┤
+* │   >0    │   >0    │  둘 중 먼저 만족되는 조건에 반환       │
+* │         │         │  VMIN 바이트 받거나                    │
+* │         │         │  첫 바이트 후 VTIME 경과               │
+* │         │         │  "바이트 간 타임아웃"                  │
+* └─────────┴─────────┴────────────────────────────────────────┘
+* 
+* 우리 설정 (VMIN=0, VTIME=10):
+*   - 데이터 있으면 즉시 읽어서 반환
+*   - 없으면 1초(10 × 0.1초) 대기 후 0 반환
+*   - read()가 절대 무한히 블록되지 않음 → 안전
+*   - 폴링 방식으로 구현할 때 적합
+* 
+* 다른 c_cc 인덱스들 (Canonical 모드에서 사용):
+*   c_cc[VINTR]  - 인터럽트 문자 (기본: 0x03 = Ctrl+C)
+*   c_cc[VQUIT]  - 종료 문자 (기본: 0x1C = Ctrl+\)
+*   c_cc[VERASE] - 지우기 문자 (기본: 0x7F = DEL 또는 0x08 = BS)
+*   c_cc[VKILL]  - 줄 전체 지우기 (기본: 0x15 = Ctrl+U)
+*   c_cc[VEOF]   - 파일 끝 (기본: 0x04 = Ctrl+D)
+*   c_cc[VSTART] - XON 재개 (기본: 0x11 = Ctrl+Q)
+*   c_cc[VSTOP]  - XOFF 중지 (기본: 0x13 = Ctrl+S)
+*   c_cc[VSUSP]  - 중지 (기본: 0x1A = Ctrl+Z)
+*   c_cc[VEOL]   - 추가 줄 끝 문자
+*   c_cc[VREPRINT] - 재출력 (기본: Ctrl+R)
+*   c_cc[VDISCARD] - 출력 버리기 (기본: Ctrl+O)
+*   c_cc[VWERASE]  - 단어 지우기 (기본: Ctrl+W)
+*   c_cc[VLNEXT]   - 다음 문자 리터럴로 (기본: Ctrl+V)
+*/
+
+
+// ========================================================================
+// 버퍼 플러시 및 설정 적용
+// ========================================================================
+
+/*
+* tcflush(): 입출력 버퍼 비우기
+* 
+* TCIFLUSH  - 입력 버퍼만 비움 (수신했지만 아직 안 읽은 데이터)
+* TCOFLUSH  - 출력 버퍼만 비움 (write했지만 아직 안 보낸 데이터)
+* TCIOFLUSH - 둘 다 비움
+* 
+* 왜 필요한가?
+*   1. 이전 프로그램이 남긴 쓰레기 데이터가 버퍼에 있을 수 있음
+*   2. 디바이스 열릴 때 노이즈가 들어왔을 수 있음
+*   3. 새 설정 적용 전에 깨끗한 상태로 시작
+*/
+tcflush(uart_fd, TCIOFLUSH);
+
+/*
+* tcsetattr(): 터미널(UART) 속성 설정/적용
+* 
+* 두 번째 파라미터 (적용 시점):
+*   TCSANOW   - 즉시 적용
+*   TCSADRAIN - 출력 버퍼가 비워진 후 적용 (전송 완료 대기)
+*   TCSAFLUSH - 입출력 버퍼 비우고 적용
+* 
+* 보통 TCSANOW 사용
+* 이미 tcflush()로 버퍼 비웠으므로
+*/
+tcsetattr(uart_fd, TCSANOW, &options);
+printf("UART configured: %d 8N1\n", baudrate);
+
+/*
+* 최종 설정 요약: "8N1"
+* 
+*   8 = 데이터 비트 8개 (CS8)
+*   N = No parity, 패리티 없음
+*   1 = 정지 비트 1개 (기본값)
+* 
+* 프레임 구조:
+* 
+*   유휴   시작   데이터 (8비트)            정지   유휴
+*   (HIGH)  1bit  D0 D1 D2 D3 D4 D5 D6 D7   1bit  (HIGH)
+*   
+*   ─────┐     ┌──┬──┬──┬──┬──┬──┬──┬──┐     ┌─────
+*        │     │  │  │  │  │  │  │  │  │     │
+*        └─────┴──┴──┴──┴──┴──┴──┴──┴──┴─────┘
+*        (LOW)                           (HIGH)
+*   
+*   총 10비트: 시작(1) + 데이터(8) + 정지(1) = 10
+*   
+*   9600 bps에서 1문자 전송 시간:
+*     10비트 / 9600 = 약 1.04ms
+*/
+
+
+// ========================================================================
+// CSV 파일 열기
+// ========================================================================
+/*
+* fopen(경로, 모드)
+* 
+* "a" 모드 (append):
+*   - 파일 끝에 추가
+*   - 기존 데이터 보존
+*   - 파일 없으면 새로 생성
+* 
+* 다른 모드들:
+*   "r"  - 읽기 (파일 없으면 실패)
+*   "w"  - 쓰기 (기존 내용 삭제!)
+*   "a"  - 추가 (기존 내용 유지)
+*   "r+" - 읽기/쓰기
+*   "w+" - 읽기/쓰기 (기존 내용 삭제)
+*   "a+" - 읽기/추가
+*/
+FILE *fp = fopen(CSV_PATH, "a");
+if (!fp) {
+perror("CSV open error");
+close(uart_fd);
+return -1;
+}
+
+
+// ========================================================================
+// 아두이노 초기화 대기
+// ========================================================================
+/*
+* 아두이노는 시리얼 연결 시 자동 리셋됨
+* 
+* 왜 리셋되나?
+*   - 라즈베리파이가 UART를 열면 DTR(Data Terminal Ready) 신호 변화
+*   - 아두이노 보드의 리셋 회로가 DTR에 연결되어 있음
+*   - DTR 변화 → 커패시터 → 리셋 핀 → 아두이노 재시작
+*   
+*   이건 아두이노 프로그래밍 업로드를 위한 설계:
+*     IDE가 시리얼 연결 → 자동 리셋 → 부트로더 대기 → 업로드
+* 
+* 리셋 후 소요 시간:
+*   - 부트로더: ~1초 (LED 깜빡임)
+*   - setup() 실행: ~0.5초
+*   - 총 약 1.5~2초
+* 
+* 대기 안 하면?
+*   - 아두이노가 아직 준비 안 됨
+*   - 첫 몇 개 패킷 손실
+*   - 부트로더가 보낸 쓰레기 데이터가 버퍼에 있을 수 있음
+*/
+printf("Waiting for Arduino initialization...\n");
+sleep(2);  // 2초 대기
+
+// 초기화 중 들어온 쓰레기 데이터 제거
+// 부트로더가 보낸 데이터, 노이즈 등
+tcflush(uart_fd, TCIOFLUSH);
+
+printf("Starting communication loop...\n\n");
+
+
+// ========================================================================
+// 메인 통신 루프
+// ========================================================================
+/*
+* 무한 루프로 계속해서 통신 테스트 수행
+* 종료하려면 Ctrl+C
+* 
+* 각 루프에서:
+*   1. 랜덤 패킷 생성
+*   2. 송신
+*   3. 수신
+*   4. 비교 및 결과 기록
+*/
+int loop_count = 0;
+
+while (1) {
+printf("\n========== Loop %d ==========\n", ++loop_count);
+
+// 새로운 랜덤 패킷 생성
+generate_random_packet(send_packet, packet_len);
+
+// 송신 버퍼 비우기 (이전 잔여 데이터 제거)
+tcflush(uart_fd, TCOFLUSH);
+
+
+// ====================================================================
+// 데이터 송신
+// ====================================================================
+printf("[SEND] Writing packet...\n");
+
+/*
+* write(fd, buffer, count): 데이터 송신
+* 
+* 파라미터:
+*   fd     - 파일 디스크립터
+*   buffer - 보낼 데이터 버퍼
+*   count  - 보낼 바이트 수
+* 
+* 반환값:
+*   성공: 실제로 쓴 바이트 수 (count보다 작을 수 있음)
+*   실패: -1
+* 
+* 중요:
+*   write()는 데이터를 커널 버퍼에 복사하는 것!
+*   실제 물리적 전송은 비동기로 진행됨
+*   write() 반환 ≠ 전송 완료
+*/
+ssize_t written = write(uart_fd, send_packet, strlen(send_packet));
+
+// 개행 문자 전송
+// 아두이노의 Serial.readStringUntil('\n')이 줄 끝을 인식하도록
+write(uart_fd, "\n", 1);
+
+/*
+* tcdrain(fd): 출력 완료까지 대기
+* 
+* 커널 버퍼의 모든 데이터가 물리적으로 전송될 때까지 블록
+* 
+* 왜 필요한가?
+*   write() 직후에 바로 read()하면:
+*   - 데이터가 아직 전송 중일 수 있음
+*   - 아두이노가 받기도 전에 응답을 기다림
+*   - 타임아웃 발생
+*   
+*   tcdrain() 후에 read()하면:
+*   - 모든 데이터 전송 완료 보장
+*   - 아두이노가 데이터를 다 받음
+*   - 정상적인 에코 가능
+*/
+tcdrain(uart_fd);
+
+printf("[SEND] Written %zd bytes\n", written);  // %zd: ssize_t 출력
+print_hex("SENT", send_packet);
+
+
+// ====================================================================
+// 데이터 수신
+// ====================================================================
+printf("[RECV] Waiting for response (100ms)...\n");
+
+/*
+* usleep(microseconds): 마이크로초 단위 대기
+* 
+* 100,000μs = 100ms = 0.1초
+* 
+* 왜 대기하나?
+*   아두이노 처리 시간:
+*     1. Serial 버퍼에서 데이터 읽기
+*     2. readStringUntil() 파싱
+*     3. println()으로 에코
+*   
+*   9600 bps에서 10문자 에코 시간:
+*     10문자 × 10비트 × 2(송수신) / 9600 ≈ 21ms
+*   
+*   100ms면 충분한 여유
+*/
+usleep(100000);
+
+// 응답 한 줄 읽기
+int len = read_line(uart_fd, buffer, sizeof(buffer));
+
+if (len > 0) {
+// 데이터 수신 성공
+print_hex("RECV_RAW", buffer);
+
+
+// ================================================================
+// 문자열 트리밍 (앞뒤 공백/제어문자 제거)
+// ================================================================
+/*
+* 통신 과정에서 앞뒤에 불필요한 문자가 붙을 수 있음:
+*   - 아두이노 Serial.println()이 붙인 \r\n
+*   - 노이즈로 인한 쓰레기 문자
+*   - 타이밍 이슈로 인한 추가 문자
+* 
+* 정확한 비교를 위해 제거
+*/
+char *trimmed = buffer;
+
+// 앞쪽 공백/탭 제거
+// 포인터를 앞으로 이동시켜서 건너뜀
+while (*trimmed == ' ' || *trimmed == '\t') {
+trimmed++;
+}
+
+// 뒤쪽 공백/제어문자 제거
+// 끝에서부터 null로 덮어씀
+char *end = trimmed + strlen(trimmed) - 1;
+while (end > trimmed && 
+(*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
+*end = '\0';
+end--;
+}
+
+print_hex("RECV_TRIMMED", trimmed);
+
+
+// ================================================================
+// 송수신 데이터 비교
+// ================================================================
+/*
+* strcmp(s1, s2): 두 문자열 비교
+* 
+* 반환값:
+*   0       - 완전 일치 (s1 == s2)
+*   양수    - s1 > s2 (사전순)
+*   음수    - s1 < s2 (사전순)
+* 
+* 한 글자라도 다르면 0이 아닌 값 반환
+*/
+int cmp_result = strcmp(trimmed, send_packet);
+printf("strcmp(RECV, SENT) = %d\n", cmp_result);
+
+// 결과 문자열 설정
+// 삼항 연산자: (조건) ? 참일때값 : 거짓일때값
+char *result = (cmp_result == 0) ? "OK" : "ERR";
+
+
+// ================================================================
+// 타임스탬프 생성
+// ================================================================
+/*
+* time(NULL): 현재 시간
+*   1970년 1월 1일 00:00:00 UTC부터 경과한 초
+*   time_t 타입 (보통 long int)
+* 
+* localtime(&now): 지역 시간으로 변환
+*   struct tm 구조체 포인터 반환
+*   tm_year, tm_mon, tm_mday, tm_hour, tm_min, tm_sec 등 포함
+* 
+* strftime(): 시간을 포맷 문자열로 변환
+*   %Y - 4자리 년도 (2024)
+*   %m - 2자리 월 (01-12)
+*   %d - 2자리 일 (01-31)
+*   %H - 24시간제 시 (00-23)
+*   %M - 분 (00-59)
+*   %S - 초 (00-59)
+*/
+time_t now = time(NULL);
+struct tm *t = localtime(&now);
+char timestamp[64];
+strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", t);
+
+
+// ================================================================
+// CSV 파일에 결과 저장
+// ================================================================
+/*
+* fprintf(): 파일에 포맷팅된 문자열 출력
+* 
+* CSV 형식:
+*   타임스탬프,결과,패킷내용,케이블길이,Baudrate
+*   
+* 예:
+*   2024-01-15 14:30:45,OK,AbCd123XyZ,1.50,9600
+*   2024-01-15 14:30:46,ERR,QwErTy9876,1.50,9600
+* 
+* 이 데이터로 나중에:
+*   - 에러율 통계 계산
+*   - 머신러닝 모델 훈련
+*   - 케이블 길이/Baudrate별 신뢰성 분석
+*/
+fprintf(fp, "%s,%s,%s,%.2f,%d\n",
+timestamp,      // %s: 문자열
+result,         // %s: "OK" 또는 "ERR"
+send_packet,    // %s: 보낸 패킷 (비교용)
+cable_length,   // %.2f: 소수점 2자리 실수
+baudrate);      // %d: 정수
+
+/*
+* fflush(fp): 버퍼를 파일에 즉시 기록
+* 
+* 기본적으로 fprintf()는 버퍼에 쓰고,
+* 버퍼가 차거나 파일을 닫을 때 실제 기록
+* 
+* fflush()를 호출하면:
+*   - 버퍼 내용을 즉시 디스크에 기록
+*   - 전원이 꺼져도 데이터 보존
+*   - 프로그램이 비정상 종료해도 데이터 살아있음
+*/
+fflush(fp);
+
+printf("\n[RESULT] %s\n", result);
+printf("[LOG] %s,%s,%s,%.2f,%d\n",
+timestamp, result, send_packet, cable_length, baudrate);
+} else {
+// 수신 실패
+// len == 0: 타임아웃 (아무 데이터도 안 옴)
+// len < 0: 에러
+printf("[ERROR] No response received (len=%d)\n", len);
+
+// 여기서 ERR로 기록해도 좋음 (현재 코드에는 없음)
+}
+
+
+// ====================================================================
+// 루프 마무리
+// ====================================================================
+
+/*
+* 수신 버퍼 비우기
+* 
+* 다음 루프를 위해 잔여 데이터 제거
+* 
+* 왜 필요한가?
+*   - 아두이노가 예상보다 많은 데이터를 보냈을 수 있음
+*   - 노이즈로 추가 바이트가 들어왔을 수 있음
+*   - 이전 응답의 \r\n 일부가 남아있을 수 있음
+*   
+* 비우지 않으면?
+*   - 다음 루프에서 이전 데이터가 섞여서 읽힘
+*   - 데이터 어긋남 (desynchronization)
+*/
+tcflush(uart_fd, TCIFLUSH);
+
+printf("\n[WAIT] 100ms before next loop...\n");
+
+// 다음 루프 전 100ms 대기
+// 아두이노가 완전히 준비되도록
+usleep(100000);
+}
+
+
+// ========================================================================
+// 정리 (이 코드는 실행되지 않음)
+// ========================================================================
+/*
+* while(1) 무한 루프이므로 여기 도달 불가
+* 
+* Ctrl+C로 종료하면:
+*   - SIGINT 시그널이 프로세스에 전달
+*   - 프로그램 즉시 종료
+*   - 이 정리 코드는 실행 안 됨
+* 
+* 제대로 정리하려면:
+*   signal(SIGINT, handler) 등록해서
+*   핸들러에서 루프 플래그 설정하고
+*   루프 탈출 후 정리
+* 
+* 실제로는 OS가 프로세스 종료 시:
+*   - 열린 파일 디스크립터 자동 닫음
+*   - 메모리 자동 해제
+* 그래서 큰 문제는 없지만, 좋은 습관은 아님
+*/
+fclose(fp);       // 파일 닫기
+close(uart_fd);   // UART 닫기
+return 0;
+}
